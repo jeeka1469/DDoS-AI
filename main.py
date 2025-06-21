@@ -5,8 +5,27 @@ import joblib
 import numpy as np
 from collections import defaultdict, deque, Counter
 from scapy.all import sniff, IP, TCP, UDP
+from scapy.arch.windows import get_windows_if_list
+import queue
+import logging
+import sys
 
-# Load model, scaler, and metadata
+logger = logging.getLogger("DDoSDetector")
+logger.setLevel(logging.DEBUG) 
+
+file_handler = logging.FileHandler("ddos_detection.log")
+file_handler.setLevel(logging.DEBUG)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+
+formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
 model = joblib.load("unified_ddos_best_model.pkl")
 scaler = joblib.load("unified_ddos_best_model_scaler.pkl")
 metadata = joblib.load("unified_ddos_best_model_metadata.pkl")
@@ -15,16 +34,18 @@ feature_columns = metadata['feature_columns']
 
 flow_packets = defaultdict(deque)
 src_ip_history = deque(maxlen=5000)
+processing_queue = queue.Queue()
+flow_lock = threading.Lock()
 
-print("\U0001F50D Real-time DDoS flow prediction started...")
+logger.info("Real-time DDoS flow prediction started")
+
 
 def calculate_entropy(ip_list):
     if not ip_list:
         return 0.0
     counts = Counter(ip_list)
     total = len(ip_list)
-    entropy = -sum((count / total) * math.log2(count / total) for count in counts.values())
-    return entropy
+    return -sum((count / total) * math.log2(count / total) for count in counts.values())
 
 def get_tcp_flags(tcp_layer):
     flags = tcp_layer.flags
@@ -92,51 +113,84 @@ def extract_features(flow_id, packets, entropy):
 
     return feat_dict
 
-def packet_handler(packet):
-    if IP not in packet:
-        return
 
-    src_ip = packet[IP].src
-    dst_ip = packet[IP].dst
-    proto = packet[IP].proto
-    src_port = dst_port = 0
-    tcp_flags = {'SYN': 0, 'ACK': 0, 'FIN': 0, 'RST': 0}
-
-    direction = 'fwd'
-
-    if proto == 6 and TCP in packet:
-        src_port = packet[TCP].sport
-        dst_port = packet[TCP].dport
-        tcp_flags = get_tcp_flags(packet[TCP])
-    elif proto == 17 and UDP in packet:
-        src_port = packet[UDP].sport
-        dst_port = packet[UDP].dport
-
-    flow_id = (src_ip, src_port, dst_ip, dst_port, proto)
-
-    direction = 'fwd' if src_port < dst_port else 'bwd'
-    timestamp = time.time()
-    pkt_len = len(packet)
-    flow_packets[flow_id].append((timestamp, pkt_len, tcp_flags, direction))
-
-    if len(flow_packets[flow_id]) > 50:
-        flow_packets[flow_id].popleft()
-
-    src_ip_history.append(src_ip)
-
-    if len(flow_packets[flow_id]) % 10 == 0:
-        entropy = calculate_entropy(src_ip_history)
+def process_packets():
+    while True:
+        packet = processing_queue.get()
         try:
-            features = extract_features(flow_id, flow_packets[flow_id], entropy)
-            X = np.array([[features[col] for col in feature_columns]], dtype=np.float32)
-            X_scaled = scaler.transform(X)
-            pred = model.predict(X_scaled)[0]
-            print(f"\n[FLOW] {flow_id} => \U0001F6E1\ufe0f Predicted: {pred}")
-        except Exception as e:
-            print(f"[WARN] Skipping prediction due to error: {e}")
+            if IP not in packet:
+                continue
 
-def start_sniff(interface=None):
-    sniff(prn=packet_handler, iface=interface, store=False)
+            src_ip = packet[IP].src
+            dst_ip = packet[IP].dst
+            proto = packet[IP].proto
+            src_port = dst_port = 0
+            tcp_flags = {'SYN': 0, 'ACK': 0, 'FIN': 0, 'RST': 0}
+
+            if proto == 6 and TCP in packet:
+                src_port = packet[TCP].sport
+                dst_port = packet[TCP].dport
+                tcp_flags = get_tcp_flags(packet[TCP])
+            elif proto == 17 and UDP in packet:
+                src_port = packet[UDP].sport
+                dst_port = packet[UDP].dport
+
+            flow_id = (src_ip, src_port, dst_ip, dst_port, proto)
+            direction = 'fwd' if src_port < dst_port else 'bwd'
+            timestamp = time.time()
+            pkt_len = len(packet)
+
+            with flow_lock:
+                flow_packets[flow_id].append((timestamp, pkt_len, tcp_flags, direction))
+                if len(flow_packets[flow_id]) > 50:
+                    flow_packets[flow_id].popleft()
+                src_ip_history.append(src_ip)
+
+            if len(flow_packets[flow_id]) % 10 == 0:
+                entropy = calculate_entropy(src_ip_history)
+                features = extract_features(flow_id, list(flow_packets[flow_id]), entropy)
+
+                if not all(col in features for col in feature_columns):
+                    logger.warning("Feature mismatch detected.")
+                    continue
+
+                X = np.array([[features[col] for col in feature_columns]], dtype=np.float32)
+                X_scaled = scaler.transform(X)
+                pred = model.predict(X_scaled)[0]
+                logger.info(f"[FLOW] {flow_id} => Predicted: {pred}")
+
+            with flow_lock:
+                now = time.time()
+                stale_flows = [fid for fid, pkts in flow_packets.items() if now - pkts[-1][0] > 60]
+                for fid in stale_flows:
+                    del flow_packets[fid]
+
+        except Exception as e:
+            logger.error(f"Failed to process packet: {e}")
+        finally:
+            processing_queue.task_done()
+
+
+def packet_handler(packet):
+    processing_queue.put(packet)
+
+
+def start_multi_interface_sniffing():
+    interfaces_info = get_windows_if_list()
+    sniffable_ifaces = [iface['name'] for iface in interfaces_info if iface['name'].startswith('\\Device\\NPF_')]
+
+    logger.info(f"🌐 Sniffable interfaces detected: {sniffable_ifaces}")
+    for iface in sniffable_ifaces:
+        logger.info(f"Sniffing on interface: {iface}")
+        threading.Thread(target=sniff, kwargs={
+            'iface': iface,
+            'prn': packet_handler,
+            'store': False
+        }, daemon=True).start()
+
 
 if __name__ == '__main__':
-    start_sniff(interface=None)
+    threading.Thread(target=process_packets, daemon=True).start()
+    start_multi_interface_sniffing()
+    while True:
+        time.sleep(10)
