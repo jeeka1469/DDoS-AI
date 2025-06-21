@@ -9,19 +9,28 @@ from scapy.arch.windows import get_windows_if_list
 import queue
 import logging
 import sys
+import signal
+import os
+from logging.handlers import RotatingFileHandler
+
+MAX_QUEUE_SIZE = 10000
+LOG_FILE = os.getenv("DDOS_LOG_FILE", "ddos_detection.log")
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
+RUNNING = True
 
 logger = logging.getLogger("DDoSDetector")
-logger.setLevel(logging.DEBUG) 
+logger.setLevel(logging.DEBUG)
 
-file_handler = logging.FileHandler("ddos_detection.log")
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
 file_handler.setLevel(logging.DEBUG)
+file_formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+file_handler.setFormatter(file_formatter)
 
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
-
-formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
-file_handler.setFormatter(formatter)
-console_handler.setFormatter(formatter)
+console_formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+console_handler.setFormatter(console_formatter)
 
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
@@ -34,11 +43,16 @@ feature_columns = metadata['feature_columns']
 
 flow_packets = defaultdict(deque)
 src_ip_history = deque(maxlen=5000)
-processing_queue = queue.Queue()
+processing_queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
 flow_lock = threading.Lock()
 
-logger.info("Real-time DDoS flow prediction started")
+def signal_handler(sig, frame):
+    global RUNNING
+    logger.info("Shutdown signal received. Cleaning up and exiting...")
+    RUNNING = False
 
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 def calculate_entropy(ip_list):
     if not ip_list:
@@ -85,12 +99,12 @@ def extract_features(flow_id, packets, entropy):
 
     try:
         proto_enc = label_encoders['Protocol'].transform([flow_id[4]])[0]
-    except:
+    except Exception:
         proto_enc = -1
 
     try:
         ip_enc = label_encoders['Source IP'].transform([flow_id[0]])[0]
-    except:
+    except Exception:
         ip_enc = -1
 
     feat_dict = {
@@ -113,10 +127,12 @@ def extract_features(flow_id, packets, entropy):
 
     return feat_dict
 
-
 def process_packets():
-    while True:
-        packet = processing_queue.get()
+    while RUNNING:
+        try:
+            packet = processing_queue.get(timeout=1)
+        except queue.Empty:
+            continue
         try:
             if IP not in packet:
                 continue
@@ -170,27 +186,49 @@ def process_packets():
         finally:
             processing_queue.task_done()
 
-
 def packet_handler(packet):
-    processing_queue.put(packet)
-
+    try:
+        processing_queue.put(packet, block=False)
+    except queue.Full:
+        logger.warning("Processing queue full. Dropping packet.")
 
 def start_multi_interface_sniffing():
     interfaces_info = get_windows_if_list()
     sniffable_ifaces = [iface['name'] for iface in interfaces_info if iface['name'].startswith('\\Device\\NPF_')]
 
-    logger.info(f"🌐 Sniffable interfaces detected: {sniffable_ifaces}")
+    if not sniffable_ifaces:
+        logger.error("No sniffable interfaces detected! Check Npcap installation and permissions.")
+        return
+
+    logger.info(f"Sniffable interfaces detected: {sniffable_ifaces}")
     for iface in sniffable_ifaces:
-        logger.info(f"Sniffing on interface: {iface}")
-        threading.Thread(target=sniff, kwargs={
+        logger.info(f"Starting sniffing on interface: {iface}")
+        t = threading.Thread(target=sniff, kwargs={
             'iface': iface,
             'prn': packet_handler,
-            'store': False
-        }, daemon=True).start()
+            'store': False,
+            'stop_filter': lambda x: not RUNNING
+        }, daemon=True)
+        t.start()
 
+def check_admin_permissions():
+    try:
+        import ctypes
+        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        if not is_admin:
+            logger.warning("You are not running this script as Administrator. Packet capture may fail.")
+        else:
+            logger.info("Administrator privileges confirmed.")
+    except Exception:
+        logger.warning("Unable to check admin privileges.")
 
 if __name__ == '__main__':
+    check_admin_permissions()
     threading.Thread(target=process_packets, daemon=True).start()
     start_multi_interface_sniffing()
-    while True:
-        time.sleep(10)
+    try:
+        while RUNNING:
+            time.sleep(10)
+    except KeyboardInterrupt:
+        RUNNING = False
+        logger.info("Keyboard interrupt received. Exiting...")
