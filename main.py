@@ -12,6 +12,7 @@ import sys
 import signal
 import os
 from logging.handlers import RotatingFileHandler
+import pandas as pd
 
 MAX_QUEUE_SIZE = 10000
 LOG_FILE = os.getenv("DDOS_LOG_FILE", "ddos_detection.log")
@@ -165,12 +166,10 @@ def process_packets():
             if len(flow_packets[flow_id]) % 10 == 0:
                 entropy = calculate_entropy(src_ip_history)
                 features = extract_features(flow_id, list(flow_packets[flow_id]), entropy)
-
                 if not all(col in features for col in feature_columns):
                     logger.warning("Feature mismatch detected.")
                     continue
-
-                X = np.array([[features[col] for col in feature_columns]], dtype=np.float32)
+                X = pd.DataFrame([[features[col] for col in feature_columns]], columns=feature_columns)
                 X_scaled = scaler.transform(X)
                 pred = model.predict(X_scaled)[0]
                 logger.info(f"[FLOW] {flow_id} => Predicted: {pred}")
@@ -192,24 +191,28 @@ def packet_handler(packet):
     except queue.Full:
         logger.warning("Processing queue full. Dropping packet.")
 
-def start_multi_interface_sniffing():
+def start_sniffing_on_first_valid_interface():
     interfaces_info = get_windows_if_list()
-    sniffable_ifaces = [iface['name'] for iface in interfaces_info if iface['name'].startswith('\\Device\\NPF_')]
+    interface_names = [iface['name'] for iface in interfaces_info]
+    logger.info(f"Available interfaces: {interface_names}")
 
-    if not sniffable_ifaces:
-        logger.error("No sniffable interfaces detected! Check Npcap installation and permissions.")
-        return
+    for iface in interface_names:
+        logger.info(f"Trying interface: {iface}")
+        try:
+            t = threading.Thread(target=sniff, kwargs={
+                'iface': iface,
+                'prn': packet_handler,
+                'store': False,
+                'stop_filter': lambda x: not RUNNING
+            }, daemon=True)
+            t.start()
+            time.sleep(5)  # Give time to confirm success
+            logger.info(f"Selected interface: {iface}")
+            return
+        except Exception as e:
+            logger.warning(f"Interface {iface} failed: {e}")
 
-    logger.info(f"Sniffable interfaces detected: {sniffable_ifaces}")
-    for iface in sniffable_ifaces:
-        logger.info(f"Starting sniffing on interface: {iface}")
-        t = threading.Thread(target=sniff, kwargs={
-            'iface': iface,
-            'prn': packet_handler,
-            'store': False,
-            'stop_filter': lambda x: not RUNNING
-        }, daemon=True)
-        t.start()
+    logger.error("No working sniffable interfaces found!")
 
 def check_admin_permissions():
     try:
@@ -225,7 +228,7 @@ def check_admin_permissions():
 if __name__ == '__main__':
     check_admin_permissions()
     threading.Thread(target=process_packets, daemon=True).start()
-    start_multi_interface_sniffing()
+    start_sniffing_on_first_valid_interface()
     try:
         while RUNNING:
             time.sleep(10)
