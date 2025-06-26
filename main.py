@@ -191,13 +191,26 @@ def packet_handler(packet):
     except queue.Full:
         logger.warning("Processing queue full. Dropping packet.")
 
-def start_sniffing_on_first_valid_interface():
+def choose_interface(interface_names):
+    print("\nAvailable Network Interfaces:")
+    for i, name in enumerate(interface_names):
+        print(f"{i}: {name}")
+    selected = input("Enter the index(es) of the interface(s) you want to sniff on (comma-separated): ")
+    indexes = [int(i.strip()) for i in selected.split(",") if i.strip().isdigit()]
+    return [interface_names[i] for i in indexes if 0 <= i < len(interface_names)]
+
+def start_sniffing_on_selected_interfaces():
     interfaces_info = get_windows_if_list()
     interface_names = [iface['name'] for iface in interfaces_info]
-    logger.info(f"Available interfaces: {interface_names}")
+    logger.info(f"Detected interfaces: {interface_names}")
 
-    for iface in interface_names:
-        logger.info(f"Trying interface: {iface}")
+    selected_interfaces = choose_interface(interface_names)
+    if not selected_interfaces:
+        logger.error("No valid interfaces selected. Exiting...")
+        return
+
+    for iface in selected_interfaces:
+        logger.info(f"Starting sniffing on: {iface}")
         try:
             t = threading.Thread(target=sniff, kwargs={
                 'iface': iface,
@@ -206,13 +219,8 @@ def start_sniffing_on_first_valid_interface():
                 'stop_filter': lambda x: not RUNNING
             }, daemon=True)
             t.start()
-            time.sleep(5)  # Give time to confirm success
-            logger.info(f"Selected interface: {iface}")
-            return
         except Exception as e:
-            logger.warning(f"Interface {iface} failed: {e}")
-
-    logger.error("No working sniffable interfaces found!")
+            logger.warning(f"Failed to start sniffing on {iface}: {e}")
 
 def check_admin_permissions():
     try:
@@ -228,7 +236,7 @@ def check_admin_permissions():
 if __name__ == '__main__':
     check_admin_permissions()
     threading.Thread(target=process_packets, daemon=True).start()
-    start_sniffing_on_first_valid_interface()
+    start_sniffing_on_selected_interfaces()
     try:
         while RUNNING:
             time.sleep(10)
