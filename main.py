@@ -99,31 +99,31 @@ def extract_features(flow_id, packets, entropy):
     down_up_ratio = bwd_count / fwd_count if fwd_count > 0 else bwd_count
 
     try:
-        proto_enc = label_encoders['Protocol'].transform([flow_id[4]])[0]
+        proto_enc = label_encoders['protocol'].transform([flow_id[4]])[0]
     except Exception:
         proto_enc = -1
 
     try:
-        ip_enc = label_encoders['Source IP'].transform([flow_id[0]])[0]
+        ip_enc = label_encoders['src_ip'].transform([flow_id[0]])[0]
     except Exception:
         ip_enc = -1
 
     feat_dict = {
-        'Flow Packets/s': packet_rate,
-        'Packet Length Mean': mean_size,
-        'Flow IAT Mean': mean_iat,
-        'SYN Flag Count': syn_count,
-        'ACK Flag Count': ack_count,
-        'RST Flag Count': rst_count,
-        'FIN Flag Count': fin_count,
-        'Flow Duration': duration,
-        'Flow Bytes/s': bytes_per_sec,
-        'Down/Up Ratio': down_up_ratio,
-        'Fwd Packets/s': fwd_rate,
-        'Bwd Packets/s': bwd_rate,
-        'Flow IAT Std': std_iat,
-        'Source IP': ip_enc,
-        'Protocol': proto_enc
+        'flow_pkts_s': packet_rate,
+        'pkt_len_mean': mean_size,
+        'flow_iat_mean': mean_iat,
+        'syn_flag_cnt': syn_count,
+        'ack_flag_cnt': ack_count,
+        'rst_flag_cnt': rst_count,
+        'fin_flag_cnt': fin_count,
+        'flow_duration': duration,
+        'flow_byts_s': bytes_per_sec,
+        'down_up_ratio': down_up_ratio,
+        'fwd_pkts_s': fwd_rate,
+        'bwd_pkts_s': bwd_rate,
+        'flow_iat_std': std_iat,
+        'src_ip': ip_enc,
+        'protocol': proto_enc
     }
 
     return feat_dict
@@ -166,9 +166,12 @@ def process_packets():
             if len(flow_packets[flow_id]) % 10 == 0:
                 entropy = calculate_entropy(src_ip_history)
                 features = extract_features(flow_id, list(flow_packets[flow_id]), entropy)
-                if not all(col in features for col in feature_columns):
-                    logger.warning("Feature mismatch detected.")
+                
+                missing_features = [col for col in feature_columns if col not in features]
+                if missing_features:
+                    logger.warning(f"Missing features for prediction: {missing_features}")
                     continue
+                
                 X = pd.DataFrame([[features[col] for col in feature_columns]], columns=feature_columns)
                 X_scaled = scaler.transform(X)
                 pred = model.predict(X_scaled)[0]
@@ -187,6 +190,7 @@ def process_packets():
 
 def packet_handler(packet):
     try:
+        logger.debug(f"Captured packet: {packet.summary()}")
         processing_queue.put(packet, block=False)
     except queue.Full:
         logger.warning("Processing queue full. Dropping packet.")
